@@ -1,0 +1,95 @@
+aws rds create-db-snapshot --db-instance-identifier mydb --db-snapshot-identifier mydb-snap-$(date +%s)
+
+aws rds modify-db-snapshot-attribute \
+  --db-snapshot-identifier mydb-snap-123456 \
+  --attribute-name restore \
+  --values-to-add 222233334444
+{
+  "Sid": "AllowUseByTargetAccount",
+  "Effect":
+   "Allow",
+  "Principal": {"AWS": "arn:aws:iam::222233334444:root"},
+  "Action": ["kms:DescribeKey","kms:CreateGrant","kms:Encrypt","kms:Decrypt","kms:ReEncrypt*","kms:GenerateDataKey*"],
+  "Resource": "*"
+}
+aws dms create-replication-instance \
+  --replication-instance-identifier my-dms-instance \
+  --replication-instance-class dms.t3.medium \
+  --allocated-storage 50
+{
+  "Version": "2012-10-17",
+  "Id": "key-consolepolicy-1",
+  "Statement": [
+    {
+      "Sid": "AllowAccountAdminsFullAccess",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::REPLACE_SRC_ACCOUNT_ID:root" },
+      "Action": "kms:*",
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowTargetAccountUse",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::REPLACE_TGT_ACCOUNT_ID:root" },
+      "Action": [
+        "kms:Encrypt",
+        "kms:Decrypt",
+        "kms:ReEncrypt*",
+        "kms:GenerateDataKey*",
+        "kms:DescribeKey",
+        "kms:CreateGrant",
+        "kms:ListGrants",
+        "kms:RevokeGrant"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+export AWS_PROFILE=$SRC_PROFILE
+export AWS_REGION=$SRC_REGION
+
+SRC_KMS_ARN=$(aws kms create-key \
+  --description "KMS key to share RDS snapshot with $TGT_ACCOUNT_ID" \
+  --query 'KeyMetadata.Arn' --output text)
+
+aws kms put-key-policy --key-id "$SRC_KMS_ARN" --policy file://src-kms-policy.json
+echo "Created source KMS: $SRC_KMS_ARN"
+SNAP_ORIG="${SNAPSHOT_PREFIX}-orig-$(date +%s)"
+
+ENCRYPTED_SNAP="${SNAPSHOT_PREFIX}-enc-$(date +%s)"
+
+aws rds copy-db-snapshot \
+  --source-db-snapshot-identifier "arn:aws:rds:${SRC_REGION}:${SRC_ACCOUNT_ID}:snapshot/${SNAP_ORIG}" \
+  --target-db-snapshot-identifier "$ENCRYPTED_SNAP" \
+  --kms-key-id "$SRC_KMS_ARN"
+
+aws rds wait db-snapshot-available --db-snapshot-identifier "$ENCRYPTED_SNAP"
+echo "Encrypted snapshot ready: $ENCRYPTED_SNAP"
+aws rds modify-db-snapshot-attribute \
+  --db-snapshot-identifier "$ENCRYPTED_SNAP" \
+  --attribute-name restore \
+  --values-to-add $TGT_ACCOUNT_ID
+export AWS_PROFILE=$TGT_PROFILE
+export AWS_REGION=$TGT_REGION
+
+TGT_KMS_ARN=$(aws kms create-key --description "Target KMS for local snapshot" \
+  --query 'KeyMetadata.Arn' --output text)
+
+SHARED_ARN="arn:aws:rds:${SRC_REGION}:${SRC_ACCOUNT_ID}:snapshot/${ENCRYPTED_SNAP}"
+TGT_LOCAL_SNAP="${SNAPSHOT_PREFIX}-tgtcopy-$(date +%s)"
+
+aws rds copy-db-snapshot \
+  --source-db-snapshot-identifier "$SHARED_ARN" \
+  --target-db-snapshot-identifier "$TGT_LOCAL_SNAP" \
+  --kms-key-id "$TGT_KMS_ARN"
+
+aws rds wait db-snapshot-available --db-snapshot-identifier "$TGT_LOCAL_SNAP"
+echo "Target local snapshot created: $TGT_LOCAL_SNAP"
+aws rds restore-db-instance-from-db-snapshot \
+  --db-instance-identifier "$NEW_DB_IDENTIFIER" \
+  --db-snapshot-identifier "$TGT_LOCAL_SNAP" \
+  --db-instance-class "$DB_INSTANCE_CLASS" \
+  --engine "$DB_ENGINE" \
+  --db-subnet-group-name "$TARGET_DB_SUBNET_GROUP" \
+  --vpc-security-group-ids "$TARGET_SECURITY_GROUP 
+.0
